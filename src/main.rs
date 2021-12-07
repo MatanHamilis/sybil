@@ -1,20 +1,27 @@
 use bitcoin::consensus::{encode, Decodable};
-use bitcoin::network::constants::{ServiceFlags, PROTOCOL_VERSION};
+use bitcoin::network::constants::ServiceFlags;
 use bitcoin::network::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::network::message_network::VersionMessage;
 use bitcoin::network::Address;
 use bitcoin::Network;
-use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use futures::future::{join_all, try_join_all};
+use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use structopt::StructOpt;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 const BUFSZ: usize = 4096;
 const CHANNEL_BUF_SZ: usize = 10;
+const PROTOCOL_VERSION: u32 = 70016;
+const HARVESTER_FREQUENCY_SECS: u64 = 20;
 #[derive(Debug, StructOpt)]
 #[structopt(name = "mystruct", about = "about string")]
 struct ProgramArgs {
@@ -24,11 +31,11 @@ struct ProgramArgs {
 
 #[derive(Debug)]
 struct IncomingMessage {
-    id: usize,
+    peer_addr: SocketAddr,
     msg: NetworkMessage,
 }
+
 struct ReceiverPeerState {
-    id: usize,
     stream_in: StreamReader<OwnedReadHalf, BUFSZ>,
     sender: Sender<IncomingMessage>,
     peer_addr: SocketAddr,
@@ -38,6 +45,7 @@ struct PeerState {
     received_ver: bool,
     received_ver_ack: bool,
     receiver_handle: JoinHandle<()>,
+    outgoing_sock: OwnedWriteHalf,
 }
 
 pub struct StreamReader<R: AsyncRead + Unpin, const BSIZE: usize> {
@@ -76,22 +84,16 @@ impl<R: AsyncRead + Unpin, const BSIZE: usize> StreamReader<R, BSIZE> {
         }
     }
 }
-
-async fn connect_to_peers(addrs: &[SocketAddr]) -> (Vec<OwnedReadHalf>, Vec<OwnedWriteHalf>) {
-    let mut incoming_sockets: Vec<_> = Vec::with_capacity(addrs.len());
-    let mut outgoing_sockets: Vec<_> = Vec::with_capacity(addrs.len());
-    for addr in addrs {
-        let sock = TcpStream::connect(addr).await;
-        if sock.is_err() {
-            continue;
-        }
-        let (sock_read, mut sock_write) = sock.unwrap().into_split();
-        if send_ver_to_peer(&mut sock_write).await.is_ok() {
-            incoming_sockets.push(sock_read);
-            outgoing_sockets.push(sock_write);
-        }
+async fn connect_to_peer(addr: &SocketAddr) -> Option<(OwnedReadHalf, OwnedWriteHalf)> {
+    let sock = TcpStream::connect(addr).await;
+    if sock.is_err() {
+        return None;
     }
-    (incoming_sockets, outgoing_sockets)
+    let (sock_read, mut sock_write) = sock.unwrap().into_split();
+    if send_ver_to_peer(&mut sock_write).await.is_ok() {
+        return Some((sock_read, sock_write));
+    }
+    None
 }
 
 fn get_current_height() -> i32 {
@@ -140,7 +142,7 @@ async fn receiver_peer_thread(mut state: ReceiverPeerState) -> () {
                 if let Err(x) = state
                     .sender
                     .send(IncomingMessage {
-                        id: state.id,
+                        peer_addr: state.peer_addr,
                         msg: n.payload,
                     })
                     .await
@@ -153,7 +155,10 @@ async fn receiver_peer_thread(mut state: ReceiverPeerState) -> () {
     }
 }
 
-async fn send_network_message(payload: NetworkMessage, sock: &mut OwnedWriteHalf) -> () {
+async fn send_network_message(
+    payload: NetworkMessage,
+    sock: &mut OwnedWriteHalf,
+) -> Result<(), ()> {
     let raw_msg = RawNetworkMessage {
         magic: Network::Bitcoin.magic(),
         payload,
@@ -161,74 +166,160 @@ async fn send_network_message(payload: NetworkMessage, sock: &mut OwnedWriteHalf
     let bytes = encode::serialize(&raw_msg);
     if let Err(error) = sock.write_all(&bytes).await {
         dbg!(format!("Error in sender thread: {:?}", error));
-        return;
+        return Err(());
+    }
+    Ok(())
+}
+async fn bootstrap_harvester(out_peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>) {
+    loop {
+        sleep(Duration::from_secs(HARVESTER_FREQUENCY_SECS));
+        println!("Fetching addresses...");
+        let mut peers = out_peers.lock().await;
+        try_join_all(peers.iter_mut().map(|(addr, peer)| {
+            let get_msg = NetworkMessage::GetAddr;
+            send_network_message(get_msg, &mut peer.outgoing_sock)
+        }))
+        .await
+        .expect("Failed to harvet addresses!");
     }
 }
-async fn bootstrap_peers(
-    sockets: Vec<OwnedReadHalf>,
-    incoming_sender: Sender<IncomingMessage>,
-) -> Vec<PeerState> {
-    sockets
-        .into_iter()
-        .enumerate()
-        .map(|(id, sock_read)| {
-            // Create receiver
-            let peer_addr = sock_read
-                .peer_addr()
-                .expect("There should be an address in the socket");
-            let receiver_state = ReceiverPeerState {
-                id,
-                stream_in: StreamReader::new(sock_read),
-                sender: incoming_sender.clone(),
-                peer_addr,
-            };
-            let receiver_handle = tokio::spawn(async move {
-                receiver_peer_thread(receiver_state).await;
-            });
 
+async fn add_receiver(
+    peer_addr: SocketAddr,
+    sender: Sender<IncomingMessage>,
+) -> Option<(SocketAddr, PeerState)> {
+    println!("Adding received! Addr: {}", peer_addr);
+    if let Some((sock_read, outgoing_sock)) = connect_to_peer(&peer_addr).await {
+        let receiver_state = ReceiverPeerState {
+            stream_in: StreamReader::new(sock_read),
+            sender,
+            peer_addr: peer_addr.clone(),
+        };
+        let receiver_handle = tokio::spawn(async move {
+            receiver_peer_thread(receiver_state).await;
+        });
+
+        return Some((
+            peer_addr,
             PeerState {
                 received_ver: false,
                 received_ver_ack: false,
                 receiver_handle,
-            }
-        })
-        .collect()
+                outgoing_sock,
+            },
+        ));
+    }
+    None
+}
+
+async fn handle_addr_message(
+    addresses: &mut Vec<SocketAddr>,
+    sock_addrs: Vec<SocketAddr>,
+    incoming_sender: Sender<IncomingMessage>,
+) -> Vec<(SocketAddr, PeerState)> {
+    join_all(sock_addrs.into_iter().filter_map(|sock_addr| {
+        if !addresses.contains(&sock_addr) {
+            addresses.push(sock_addr);
+            println!("Added another address: {}", sock_addr);
+            println!("Total addresses: {}", addresses.len());
+            return Some(add_receiver(sock_addr, incoming_sender.clone()));
+        }
+        None
+    }))
+    .await
+    .into_iter()
+    .filter_map(|x| x)
+    .collect()
 }
 
 async fn handle_peers(
-    mut peers_states: Vec<PeerState>,
+    peers_states: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     mut incoming_rec: Receiver<IncomingMessage>,
-    mut outgoing_sockets: Vec<OwnedWriteHalf>,
+    incoming_sender: Sender<IncomingMessage>,
 ) {
+    let mut addresses = {
+        let peer_states_locked = peers_states.lock().await;
+        peer_states_locked.keys().map(|addr| addr.clone()).collect()
+    };
     loop {
         let msg = match incoming_rec.recv().await {
             None => return,
             Some(msg) => msg,
         };
-        let peer = &mut peers_states[msg.id];
-        let sock_out = &mut outgoing_sockets[msg.id];
+        let mut peers_states_locked = peers_states.lock().await;
+        let peer = &mut peers_states_locked
+            .get_mut(&msg.peer_addr)
+            .expect("The key should have existed!");
+        let sock_out = &mut peer.outgoing_sock;
         let network_msg = msg.msg;
+        // dbg!(&network_msg);
         match network_msg {
-            NetworkMessage::Version(ver_msg) => {
+            NetworkMessage::Version(_) => {
                 if peer.received_ver {
-                    dbg!(format!("Already received verack from peer {}", msg.id));
+                    dbg!(format!(
+                        "Already received verack from peer {}",
+                        msg.peer_addr
+                    ));
                     continue;
                 }
                 peer.received_ver = true;
-                dbg!("Received Ver Message!");
-                dbg!(format!("{:?}", ver_msg));
                 let verack = NetworkMessage::Verack;
-                send_network_message(verack, sock_out).await;
+                send_network_message(verack, sock_out)
+                    .await
+                    .expect("Failed to send network message");
             }
             NetworkMessage::Verack => {
                 if peer.received_ver_ack {
-                    dbg!(format!("Already received verack from peer {}", msg.id));
+                    println!("Already received verack from peer {}", msg.peer_addr);
                     continue;
                 }
                 peer.received_ver_ack = true;
             }
-            n => {
-                dbg!(format!("Received some unsupported message: {}", n.cmd()));
+            NetworkMessage::Ping(nonce) => {
+                let pong_msg = NetworkMessage::Pong(nonce);
+                send_network_message(pong_msg, sock_out)
+                    .await
+                    .expect("Failed to send network message");
+                println!("Sent Pong, nonce: {}", nonce);
+            }
+            NetworkMessage::Addr(addr_msg) => {
+                let sock_addrs = addr_msg
+                    .into_iter()
+                    .filter_map(|(_, addr)| match addr.to_socket_addrs() {
+                        Err(e) => {
+                            println!("Failed to parse address! Error: {}", e);
+                            None
+                        }
+                        Ok(mut sock_addr) => sock_addr.nth(0),
+                    })
+                    .collect();
+                handle_addr_message(&mut addresses, sock_addrs, incoming_sender.clone())
+                    .await
+                    .into_iter()
+                    .for_each(|(sock_addr, peer_state)| {
+                        peers_states_locked.insert(sock_addr, peer_state);
+                    })
+            }
+            NetworkMessage::AddrV2(addr_msg) => {
+                let sock_addrs = addr_msg
+                    .into_iter()
+                    .filter_map(|addr| match addr.to_socket_addrs() {
+                        Err(e) => {
+                            println!("Failed to parse address! Error: {}", e);
+                            None
+                        }
+                        Ok(mut sock_addr) => sock_addr.nth(0),
+                    })
+                    .collect();
+                handle_addr_message(&mut addresses, sock_addrs, incoming_sender.clone())
+                    .await
+                    .into_iter()
+                    .for_each(|(sock_addr, peer_state)| {
+                        peers_states_locked.insert(sock_addr, peer_state);
+                    })
+            }
+
+            _ => {
                 continue;
             }
         }
@@ -238,9 +329,21 @@ async fn handle_peers(
 #[tokio::main]
 async fn main() {
     let arg = ProgramArgs::from_args();
-    let (incoming_sockets, outgoing_sockets) = connect_to_peers(&arg.nodes).await;
     let (incoming_send, incoming_rec) = channel::<IncomingMessage>(CHANNEL_BUF_SZ);
-    let peers_states = bootstrap_peers(incoming_sockets, incoming_send).await;
-    handle_peers(peers_states, incoming_rec, outgoing_sockets).await;
+    let peers_states: HashMap<_, _> = join_all(
+        arg.nodes
+            .into_iter()
+            .map(|addr| add_receiver(addr, incoming_send.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .into_iter()
+    .filter_map(|f| f)
+    .collect();
+    let peers_states = Arc::new(Mutex::new(peers_states));
+    let peer_states_clone = peers_states.clone();
+    let harvested_handle = tokio::spawn(async move { bootstrap_harvester(peer_states_clone) });
+    handle_peers(peers_states, incoming_rec, incoming_send).await;
+    harvested_handle.await;
     println!("Leaving... bye");
 }

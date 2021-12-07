@@ -10,3 +10,4 @@ edition = "2018"
 bitcoin = "0.27.1"
 structopt = "0.3.25"
 tokio = { version = "1.14.0", features = ["full"] }
+futures = "0.3.18"
